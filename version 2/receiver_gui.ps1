@@ -37,8 +37,16 @@ $script = {
         foreach ($port in $ports) {
 
             try {
-                $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Any,$port)
-                $listener.Start()
+               $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Any,$port)
+
+$listener.Server.SetSocketOption(
+    [System.Net.Sockets.SocketOptionLevel]::Socket,
+    [System.Net.Sockets.SocketOptionName]::ReuseAddress,
+    $true
+)
+
+$listener.Start()
+
 
                 $window.Dispatcher.Invoke({
                     $lblStatus.Content = "Listening on port $port..."
