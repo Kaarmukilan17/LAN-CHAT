@@ -4,6 +4,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # ---- CONSTANTS ----
 $maxFileSizeMB = 10
 $ports = @(9999, 9998, 9997)
+$chunkSize = 8192
 
 # ---- WINDOW ----
 $window = New-Object System.Windows.Window
@@ -82,9 +83,8 @@ $btnSend.Add_Click({
     }
 })
 
-# ---- SEND FILE (HEADER ONLY) ----
+# ---- SEND FILE (COMPLETE TRANSFER) ----
 $btnSendFile.Add_Click({
-
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
     $dialog.Title = "Select a file to send"
 
@@ -106,10 +106,12 @@ $btnSendFile.Add_Click({
     }
 
     $txtLog.AppendText(
-        "[$time] You selected file:`r`n$fileName ($fileSizeMB MB)`r`n`r`n"
+        "[$time] Requesting to send:`r`n$fileName ($fileSizeMB MB)`r`n"
     )
     $txtLog.ScrollToEnd()
 
+    # Send file request
+    $requestSent = $false
     foreach ($port in $ports) {
         try {
             $client = New-Object System.Net.Sockets.TcpClient($txtIP.Text.Trim(), $port)
@@ -117,12 +119,78 @@ $btnSendFile.Add_Click({
             $writer = New-Object System.IO.StreamWriter($stream)
             $writer.AutoFlush = $true
 
-            $writer.Write("FILE|$fileName|$fileSizeBytes")
+            $writer.WriteLine("FILEREQ|$fileName|$fileSizeBytes")
 
             $writer.Close()
             $client.Close()
+            $requestSent = $true
             break
         } catch {}
+    }
+
+    if (-not $requestSent) {
+        $txtLog.AppendText("Failed to send request.`r`n`r`n")
+        $txtLog.ScrollToEnd()
+        return
+    }
+
+    # Wait for acceptance response
+    Start-Sleep -Milliseconds 800
+
+    # Try to send the actual file data
+    $fileSent = $false
+    foreach ($port in $ports) {
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient($txtIP.Text.Trim(), $port)
+            $stream = $client.GetStream()
+            
+            # Send file data header
+            $headerBytes = [System.Text.Encoding]::UTF8.GetBytes("FILEDATA|$fileName|$fileSizeBytes|")
+            $stream.Write($headerBytes, 0, $headerBytes.Length)
+
+            # Send actual file content
+            $fileStream = [System.IO.File]::OpenRead($filePath)
+            $buffer = New-Object byte[] $chunkSize
+            $totalSent = 0
+
+            while (($bytesRead = $fileStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $stream.Write($buffer, 0, $bytesRead)
+                $totalSent += $bytesRead
+                
+                $window.Dispatcher.Invoke({
+                    $percent = [Math]::Round(($totalSent / $fileSizeBytes) * 100, 1)
+                    $lblStatus.Content = "Sending: $percent%"
+                })
+            }
+
+            $fileStream.Close()
+            $stream.Close()
+            $client.Close()
+            
+            $fileSent = $true
+
+            $window.Dispatcher.Invoke({
+                $time = (Get-Date).ToString("HH:mm:ss")
+                $txtLog.AppendText("[$time] File sent successfully!`r`n`r`n")
+                $txtLog.ScrollToEnd()
+                $lblStatus.Content = "Listening..."
+            })
+
+            break
+        } catch {
+            $window.Dispatcher.Invoke({
+                $lblStatus.Content = "Send failed, retrying..."
+            })
+        }
+    }
+
+    if (-not $fileSent) {
+        $window.Dispatcher.Invoke({
+            $time = (Get-Date).ToString("HH:mm:ss")
+            $txtLog.AppendText("[$time] Failed to send file.`r`n`r`n")
+            $txtLog.ScrollToEnd()
+            $lblStatus.Content = "Listening..."
+        })
     }
 })
 
@@ -148,6 +216,7 @@ $receiveScript = {
     param($window, $txtLog, $lblStatus)
 
     $ports = @(9999, 9998, 9997)
+    $chunkSize = 8192
 
     while ($true) {
         foreach ($port in $ports) {
@@ -163,34 +232,134 @@ $receiveScript = {
 
                 $client = $listener.AcceptTcpClient()
                 $stream = $client.GetStream()
-                $reader = New-Object System.IO.StreamReader($stream)
-                $raw = $reader.ReadToEnd()
 
-                $reader.Close()
-                $client.Close()
-                $listener.Stop()
+                # Read initial header
+                $headerBuffer = New-Object byte[] 1024
+                $headerLength = $stream.Read($headerBuffer, 0, $headerBuffer.Length)
+                $header = [System.Text.Encoding]::UTF8.GetString($headerBuffer, 0, $headerLength)
 
                 $time = (Get-Date).ToString("HH:mm:ss")
 
-                if ($raw.StartsWith("MSG|")) {
-                    $text = $raw.Substring(4)
+                # Handle regular message
+                if ($header.StartsWith("MSG|")) {
+                    $text = $header.Substring(4)
                     $window.Dispatcher.Invoke({
                         $txtLog.AppendText("[$time] Peer:`r`n$text`r`n`r`n")
                         $txtLog.ScrollToEnd()
                     })
                 }
-                elseif ($raw.StartsWith("FILE|")) {
-                    $parts = $raw.Split("|")
+                # Handle file request
+                elseif ($header.StartsWith("FILEREQ|")) {
+                    $parts = $header.Trim().Split("|")
                     $fileName = $parts[1]
-                    $fileSizeMB = [Math]::Round(([int64]$parts[2]) / 1MB, 2)
+                    $fileSize = [int64]$parts[2]
+                    $fileSizeMB = [Math]::Round($fileSize / 1MB, 2)
 
                     $window.Dispatcher.Invoke({
-                        $txtLog.AppendText(
-                            "[$time] Peer wants to send file:`r`n$fileName ($fileSizeMB MB)`r`n`r`n"
+                        $result = [System.Windows.MessageBox]::Show(
+                            "Accept file from peer?`n`nFile: $fileName`nSize: $fileSizeMB MB",
+                            "Incoming File",
+                            [System.Windows.MessageBoxButton]::YesNo,
+                            [System.Windows.MessageBoxImage]::Question
                         )
-                        $txtLog.ScrollToEnd()
+
+                        if ($result -eq [System.Windows.MessageBoxResult]::Yes) {
+                            $txtLog.AppendText("[$time] Waiting for file: $fileName`r`n")
+                            $txtLog.ScrollToEnd()
+                        } else {
+                            $txtLog.AppendText("[$time] Rejected file: $fileName`r`n`r`n")
+                            $txtLog.ScrollToEnd()
+                        }
                     })
                 }
+                # Handle file data transfer
+                elseif ($header.StartsWith("FILEDATA|")) {
+                    # Parse header
+                    $headerEnd = $header.IndexOf("|", 9)
+                    $headerEnd = $header.IndexOf("|", $headerEnd + 1)
+                    $headerEnd = $header.IndexOf("|", $headerEnd + 1)
+                    
+                    $headerStr = $header.Substring(0, $headerEnd + 1)
+                    $parts = $headerStr.Split("|")
+                    $fileName = $parts[1]
+                    $fileSize = [int64]$parts[2]
+                    
+                    # Extract file extension
+                    $fileExtension = [System.IO.Path]::GetExtension($fileName)
+
+                    $window.Dispatcher.Invoke({
+                        $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+                        $saveDialog.FileName = $fileName
+                        $saveDialog.Title = "Save received file"
+                        
+                        # Set filter based on file extension
+                        if ($fileExtension) {
+                            $extName = $fileExtension.TrimStart('.')
+                            $saveDialog.Filter = "$extName files (*$fileExtension)|*$fileExtension|All files (*.*)|*.*"
+                            $saveDialog.DefaultExt = $fileExtension
+                        } else {
+                            $saveDialog.Filter = "All files (*.*)|*.*"
+                        }
+
+                        if ($saveDialog.ShowDialog() -eq "OK") {
+                            $savePath = $saveDialog.FileName
+                            
+                            # Ensure file has correct extension
+                            if ($fileExtension -and -not $savePath.EndsWith($fileExtension)) {
+                                $savePath = $savePath + $fileExtension
+                            }
+                            
+                            try {
+                                $fileStream = [System.IO.File]::Create($savePath)
+                                
+                                # Write any data after the header
+                                $dataStart = $headerStr.Length
+                                if ($headerLength -gt $dataStart) {
+                                    $initialDataLength = $headerLength - $dataStart
+                                    $fileStream.Write($headerBuffer, $dataStart, $initialDataLength)
+                                    $totalReceived = $initialDataLength
+                                } else {
+                                    $totalReceived = 0
+                                }
+
+                                # Receive remaining file data
+                                $buffer = New-Object byte[] $chunkSize
+                                while ($totalReceived -lt $fileSize) {
+                                    $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
+                                    if ($bytesRead -eq 0) { break }
+                                    
+                                    $fileStream.Write($buffer, 0, $bytesRead)
+                                    $totalReceived += $bytesRead
+                                    
+                                    $percent = [Math]::Round(($totalReceived / $fileSize) * 100, 1)
+                                    $lblStatus.Content = "Receiving: $percent%"
+                                }
+
+                                $fileStream.Close()
+
+                                $time = (Get-Date).ToString("HH:mm:ss")
+                                $fileSizeMB = [Math]::Round($fileSize / 1MB, 2)
+                                $txtLog.AppendText("[$time] File received successfully!`r`n")
+                                $txtLog.AppendText("Name: $fileName`r`n")
+                                $txtLog.AppendText("Size: $fileSizeMB MB`r`n")
+                                $txtLog.AppendText("Saved to: $savePath`r`n`r`n")
+                                $txtLog.ScrollToEnd()
+                                $lblStatus.Content = "Listening..."
+
+                            } catch {
+                                $txtLog.AppendText("[$time] Error saving file: $_`r`n`r`n")
+                                $txtLog.ScrollToEnd()
+                            }
+                        } else {
+                            $txtLog.AppendText("[$time] Save cancelled by user.`r`n`r`n")
+                            $txtLog.ScrollToEnd()
+                        }
+                    })
+                }
+
+                $stream.Close()
+                $client.Close()
+                $listener.Stop()
 
             } catch {
                 try { $listener.Stop() } catch {}
