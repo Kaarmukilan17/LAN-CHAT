@@ -19,7 +19,7 @@ $panel.Margin = 10
 $lblIP = New-Object System.Windows.Controls.Label
 $lblIP.Content = "Peer IP:"
 $txtIP = New-Object System.Windows.Controls.TextBox
-$txtIP.Text = "127.0.0.1"
+$txtIP.Text = "10.154.90.128"
 $txtIP.FontSize = 14
 
 # ---- STATUS ----
